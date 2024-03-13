@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     env::current_exe,
+    f32::consts::TAU,
     time::{Duration, Instant},
 };
 
@@ -24,8 +25,8 @@ use winit::{
 
 // TODO: Make this 2047 or something so that mipmapping works.
 const GRID_SIZE: u32 = 128;
-const TRACE_SIZE: u32 = 256;
-const TRACE_LENGTH: u32 = 146;
+const TRACE_SIZE: u32 = GRID_SIZE * 2;
+const TRACE_LENGTH: u32 = (1.25 * GRID_SIZE as f32) as u32;
 const SCALING: u32 = 16;
 const NUM_DIRECTIONS: u32 = 64;
 const BLUR: f32 = 0.3;
@@ -124,7 +125,7 @@ fn main() {
                 for i in 0..NUM_DIRECTIONS {
                     *color += lights.read(pos.extend(i));
                 }
-                color * Vec3::expr(0.5, 0.0, 0.0)
+                color * Vec3::expr(0.05, 0.0, 0.0)
             };
             display.write(display_pos, color.extend(1.0));
         }),
@@ -137,18 +138,16 @@ fn main() {
         }),
     );
 
-    let update_kernel = Kernel::<fn(u32)>::new(
+    let update_kernel = Kernel::<fn()>::new(
         &device,
-        &track!(|dir| {
+        &track!(|| {
             set_block_size([TRACE_SIZE, 1, 1]);
-            // let dir = block_id().y;
+            let dir = block_id().y;
             let index = dispatch_id().x;
-            let angle = (dir.cast_f32() * 2.0 * std::f32::consts::PI) / NUM_DIRECTIONS as f32;
+            let angle = (dir.cast_f32() * TAU) / NUM_DIRECTIONS as f32;
             let quadrant = ((dir + NUM_DIRECTIONS / 8) / (NUM_DIRECTIONS / 4)) % 4;
-            let quadrant_angle = ((dir.cast_f32() / NUM_DIRECTIONS as f32)
-                - (quadrant.cast_f32() / 4.0))
-                * 2.0
-                * std::f32::consts::PI;
+            let quadrant_angle =
+                ((dir.cast_f32() / NUM_DIRECTIONS as f32) - (quadrant.cast_f32() / 4.0)) * TAU;
             let slope = quadrant_angle.tan();
             let correction = (1.0 + slope * slope).sqrt();
             let offset_slope = quadrant_angle.sin() / correction;
@@ -163,7 +162,7 @@ fn main() {
             };
             let secondary_axis = Vec2::<i32>::expr(-primary_axis.y, primary_axis.x);
             let light = 0.0_f32.var();
-            let block_offset = Vec2::<f32>::splat(64.0)
+            let block_offset = Vec2::<f32>::splat(GRID_SIZE as f32 / 2.0)
                 - (TRACE_LENGTH as f32 / 2.0) * Vec2::expr(angle.cos(), angle.sin()) * correction
                 - (TRACE_SIZE as f32 / 2.0) * Vec2::expr(-angle.sin(), angle.cos()) / correction;
             let block_offset = block_offset.cast_i32();
@@ -199,8 +198,36 @@ fn main() {
 
     let write_wall_kernel = Kernel::<fn(Vec2<u32>, f32)>::new(
         &device,
-        &track!(|pos: Expr<Vec2<u32>>, value: Expr<f32>| {
+        &track!(|pos, value| {
             walls.write(pos, value);
+        }),
+    );
+
+    let write_ball_kernel = Kernel::<fn(f32)>::new(
+        &device,
+        &track!(|radius| {
+            let pos = dispatch_id().xy();
+            let center = Vec2::splat(GRID_SIZE as f32 / 2.0);
+            let dist = (pos.cast_f32() - center).length();
+            if dist < radius {
+                walls.write(pos, 1.0);
+            }
+        }),
+    );
+
+    let staging = device.create_buffer::<f32>(1);
+
+    let get_light_at = Kernel::<fn(Vec2<f32>, u32)>::new(
+        &device,
+        &track!(|pos, dir| {
+            let dx = pos.x - pos.x.floor();
+            let dy = pos.y - pos.y.floor();
+            let pos = pos.floor().cast_u32().extend(dir);
+            let light = lights.read(pos) * dx * dy
+                + lights.read(pos + Vec3::x()) * (1.0 - dx) * dy
+                + lights.read(pos + Vec3::y()) * dx * (1.0 - dy)
+                + lights.read(pos + Vec3::splat(1)) * (1.0 - dx) * (1.0 - dy);
+            staging.write(0, light);
         }),
     );
 
@@ -247,6 +274,54 @@ fn main() {
 
     let mut avg_iter_time = 0.0;
 
+    /*
+       let scope = device.default_stream().scope();
+       scope.submit(vec![
+           write_ball_kernel.dispatch_async([GRID_SIZE, GRID_SIZE, 1], &0.01),
+           update_kernel.dispatch_async([TRACE_SIZE, NUM_DIRECTIONS, 1]),
+       ]);
+       const NUM_SAMPLES: usize = 5;
+       for dir in 0..NUM_DIRECTIONS {
+           let mut samples = [0.0_f32; NUM_SAMPLES];
+           for (i, sample) in samples.iter_mut().enumerate() {
+               const SAMPLE_DIST: f32 = 50.0;
+               let angle = dir as f32 / NUM_DIRECTIONS as f32 * TAU
+                   + (i as f32 / (NUM_SAMPLES as f32 - 1.0) - 0.5) * 2.0 * TAU / NUM_DIRECTIONS as f32;
+               let pos = Vec2::new(
+                   GRID_SIZE as f32 / 2.0 + angle.cos() * SAMPLE_DIST,
+                   GRID_SIZE as f32 / 2.0 + angle.sin() * SAMPLE_DIST,
+               );
+               get_light_at.dispatch([1, 1, 1], &pos, &dir);
+               let light = staging.copy_to_vec()[0];
+               *sample = light;
+               write_wall_kernel.dispatch([1, 1, 1], &Vec2::new(pos.x as u32, pos.y as u32), &1.0);
+           }
+           let total_light = samples.iter().sum::<f32>();
+           let avg_angle = samples
+               .iter()
+               .enumerate()
+               .map(|(i, sample)| *sample * (i as f32 / (NUM_SAMPLES as f32 - 1.0) - 0.5))
+               .sum::<f32>()
+               / total_light;
+           let angle_variance = samples
+               .iter()
+               .enumerate()
+               .map(|(i, sample)| {
+                   let angle = i as f32 / (NUM_SAMPLES as f32 - 1.0) - 0.5;
+                   let diff = angle - avg_angle;
+                   diff * diff * *sample
+               })
+               .sum::<f32>()
+               / total_light;
+           println!(
+               "Direction: {}, Total light: {}, Avg angle: {}, Angle variance: {}",
+               dir,
+               total_light,
+               avg_angle,
+               angle_variance.sqrt()
+           );
+       }
+    */
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop
         .run(move |event, elwt| match event {
@@ -267,7 +342,7 @@ fn main() {
 
                             commands.extend([
                                 clear_kernel.dispatch_async([GRID_SIZE, GRID_SIZE, NUM_DIRECTIONS]),
-                                update_kernel.dispatch_async([TRACE_SIZE, 1, 1], &rt.dir),
+                                update_kernel.dispatch_async([TRACE_SIZE, NUM_DIRECTIONS, 1]),
                                 draw_kernel.dispatch_async([
                                     GRID_SIZE * SCALING,
                                     GRID_SIZE * SCALING,
@@ -276,7 +351,8 @@ fn main() {
                             ]);
                             scope.submit(commands);
                         }
-                        avg_iter_time = avg_iter_time * 0.9 + iter_st.elapsed().as_secs_f64() * 0.1;
+                        avg_iter_time =
+                            avg_iter_time * 0.99 + iter_st.elapsed().as_secs_f64() * 0.01;
                         if rt.t % 60 == 0 {
                             println!("Avg iter time: {}", avg_iter_time * 1000.0);
                         }
