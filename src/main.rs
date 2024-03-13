@@ -141,6 +141,8 @@ fn main() {
     let update_kernel = Kernel::<fn()>::new(
         &device,
         &track!(|| {
+            // If block size is too big,
+            // can manually run multiple rays per block.
             set_block_size([TRACE_SIZE, 1, 1]);
             let dir = block_id().y;
             let index = dispatch_id().x;
@@ -203,34 +205,6 @@ fn main() {
         }),
     );
 
-    let write_ball_kernel = Kernel::<fn(f32)>::new(
-        &device,
-        &track!(|radius| {
-            let pos = dispatch_id().xy();
-            let center = Vec2::splat(GRID_SIZE as f32 / 2.0);
-            let dist = (pos.cast_f32() - center).length();
-            if dist < radius {
-                walls.write(pos, 1.0);
-            }
-        }),
-    );
-
-    let staging = device.create_buffer::<f32>(1);
-
-    let get_light_at = Kernel::<fn(Vec2<f32>, u32)>::new(
-        &device,
-        &track!(|pos, dir| {
-            let dx = pos.x - pos.x.floor();
-            let dy = pos.y - pos.y.floor();
-            let pos = pos.floor().cast_u32().extend(dir);
-            let light = lights.read(pos) * dx * dy
-                + lights.read(pos + Vec3::x()) * (1.0 - dx) * dy
-                + lights.read(pos + Vec3::y()) * dx * (1.0 - dy)
-                + lights.read(pos + Vec3::splat(1)) * (1.0 - dx) * (1.0 - dy);
-            staging.write(0, light);
-        }),
-    );
-
     let mut active_buttons = HashSet::new();
 
     let mut update_cursor = |active_buttons: &HashSet<MouseButton>, rt: &mut Runtime| {
@@ -274,54 +248,6 @@ fn main() {
 
     let mut avg_iter_time = 0.0;
 
-    /*
-       let scope = device.default_stream().scope();
-       scope.submit(vec![
-           write_ball_kernel.dispatch_async([GRID_SIZE, GRID_SIZE, 1], &0.01),
-           update_kernel.dispatch_async([TRACE_SIZE, NUM_DIRECTIONS, 1]),
-       ]);
-       const NUM_SAMPLES: usize = 5;
-       for dir in 0..NUM_DIRECTIONS {
-           let mut samples = [0.0_f32; NUM_SAMPLES];
-           for (i, sample) in samples.iter_mut().enumerate() {
-               const SAMPLE_DIST: f32 = 50.0;
-               let angle = dir as f32 / NUM_DIRECTIONS as f32 * TAU
-                   + (i as f32 / (NUM_SAMPLES as f32 - 1.0) - 0.5) * 2.0 * TAU / NUM_DIRECTIONS as f32;
-               let pos = Vec2::new(
-                   GRID_SIZE as f32 / 2.0 + angle.cos() * SAMPLE_DIST,
-                   GRID_SIZE as f32 / 2.0 + angle.sin() * SAMPLE_DIST,
-               );
-               get_light_at.dispatch([1, 1, 1], &pos, &dir);
-               let light = staging.copy_to_vec()[0];
-               *sample = light;
-               write_wall_kernel.dispatch([1, 1, 1], &Vec2::new(pos.x as u32, pos.y as u32), &1.0);
-           }
-           let total_light = samples.iter().sum::<f32>();
-           let avg_angle = samples
-               .iter()
-               .enumerate()
-               .map(|(i, sample)| *sample * (i as f32 / (NUM_SAMPLES as f32 - 1.0) - 0.5))
-               .sum::<f32>()
-               / total_light;
-           let angle_variance = samples
-               .iter()
-               .enumerate()
-               .map(|(i, sample)| {
-                   let angle = i as f32 / (NUM_SAMPLES as f32 - 1.0) - 0.5;
-                   let diff = angle - avg_angle;
-                   diff * diff * *sample
-               })
-               .sum::<f32>()
-               / total_light;
-           println!(
-               "Direction: {}, Total light: {}, Avg angle: {}, Angle variance: {}",
-               dir,
-               total_light,
-               avg_angle,
-               angle_variance.sqrt()
-           );
-       }
-    */
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop
         .run(move |event, elwt| match event {
