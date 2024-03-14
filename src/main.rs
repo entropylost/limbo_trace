@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     env::current_exe,
-    f32::consts::TAU,
+    f32::consts::{PI, TAU},
     time::{Duration, Instant},
 };
 
@@ -23,10 +23,9 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
 };
 
-// TODO: Make this 2047 or something so that mipmapping works.
 const GRID_SIZE: u32 = 128;
-const TRACE_SIZE: u32 = GRID_SIZE * 2;
-const TRACE_LENGTH: u32 = (1.25 * GRID_SIZE as f32) as u32;
+const TRACE_SIZE: u32 = 128;
+const TRACE_LENGTH: u32 = 128;
 const SCALING: u32 = 16;
 const NUM_DIRECTIONS: u32 = 64;
 const BLUR: f32 = 0.3;
@@ -36,6 +35,7 @@ struct Runtime {
     cursor_pos: PhysicalPosition<f64>,
     t: u32,
     dir: u32,
+    offset: i32,
 }
 impl Default for Runtime {
     fn default() -> Self {
@@ -43,8 +43,14 @@ impl Default for Runtime {
             cursor_pos: PhysicalPosition::new(0.0, 0.0),
             t: 0,
             dir: 0,
+            offset: 0,
         }
     }
+}
+
+#[tracked]
+fn sign(x: Expr<Vec2<f32>>) -> Expr<Vec2<f32>> {
+    1.0.copysign(x)
 }
 
 #[tracked]
@@ -125,7 +131,7 @@ fn main() {
                 for i in 0..NUM_DIRECTIONS {
                     *color += lights.read(pos.extend(i));
                 }
-                color * Vec3::expr(0.05, 0.0, 0.0)
+                color * Vec3::expr(1.0, 0.0, 0.0)
             };
             display.write(display_pos, color.extend(1.0));
         }),
@@ -138,62 +144,73 @@ fn main() {
         }),
     );
 
-    let update_kernel = Kernel::<fn()>::new(
+    let update_kernel = Kernel::<fn(u32)>::new(
         &device,
-        &track!(|| {
+        &track!(|t| {
             // If block size is too big,
             // can manually run multiple rays per block.
             set_block_size([TRACE_SIZE, 1, 1]);
             let dir = block_id().y;
             let index = dispatch_id().x;
-            let angle = (dir.cast_f32() * TAU) / NUM_DIRECTIONS as f32;
-            let quadrant = ((dir + NUM_DIRECTIONS / 8) / (NUM_DIRECTIONS / 4)) % 4;
-            let quadrant_angle =
-                ((dir.cast_f32() / NUM_DIRECTIONS as f32) - (quadrant.cast_f32() / 4.0)) * TAU;
-            let slope = quadrant_angle.tan();
-            let correction = (1.0 + slope * slope).sqrt();
-            let offset_slope = quadrant_angle.sin() / correction;
-            let primary_axis = if quadrant == 0 {
-                Vec2::<i32>::expr(1, 0)
-            } else if quadrant == 1 {
-                Vec2::<i32>::expr(0, 1)
-            } else if quadrant == 2 {
-                Vec2::<i32>::expr(-1, 0)
-            } else {
-                Vec2::<i32>::expr(0, -1)
-            };
-            let secondary_axis = Vec2::<i32>::expr(-primary_axis.y, primary_axis.x);
+            let angle = (dir.cast_f32() * TAU) / NUM_DIRECTIONS as f32 + 0.0001;
+            let quadrant = (dir / (NUM_DIRECTIONS / 4)) % 4;
+
             let light = 0.0_f32.var();
-            let block_offset = Vec2::<f32>::splat(GRID_SIZE as f32 / 2.0)
-                - (TRACE_LENGTH as f32 / 2.0) * Vec2::expr(angle.cos(), angle.sin()) * correction
-                - (TRACE_SIZE as f32 / 2.0) * Vec2::expr(-angle.sin(), angle.cos()) / correction;
-            let block_offset = block_offset.cast_i32();
-            let offset = block_offset + index.cast_i32() * secondary_axis;
+
+            let ray_dir = Vec2::expr(angle.cos(), angle.sin());
+            let delta_dist = 1.0 / ray_dir.abs();
+            let step = sign(ray_dir).cast_i32();
+
+            let correction = ray_dir.x.abs() + ray_dir.y.abs();
+
+            let trace_length = correction * correction * TRACE_LENGTH as f32;
+
+            let ray_pos = Vec2::<f32>::splat(GRID_SIZE as f32 / 2.0)
+                - (trace_length / 2.0) * Vec2::expr(angle.cos(), angle.sin()) / correction
+                - (TRACE_SIZE as f32 / 2.0) * Vec2::expr(-angle.sin(), angle.cos()) * correction
+                + Vec2::expr(
+                    rand_f32(Vec2::expr(dir, t), 0.expr(), 0),
+                    rand_f32(Vec2::expr(dir, t), 1.expr(), 0),
+                )
+                + index.cast_f32() * Vec2::expr(-step.y.as_f32(), step.x.as_f32())
+                + index.cast_f32()
+                    * 2.0_f32.sqrt()
+                    * (quadrant.as_f32() * PI / 2.0 + PI / 4.0 - angle).sin()
+                    * ray_dir;
+            let pos = ray_pos.floor().cast_i32().var();
+
+            let side_dist =
+                (sign(ray_dir) * (pos.cast_f32() - ray_pos) + sign(ray_dir) * 0.5 + 0.5)
+                    * delta_dist;
+            let side_dist = side_dist.var();
+
             let shared = Shared::<f32>::new(TRACE_SIZE as usize + 2);
 
-            for i in 0..TRACE_LENGTH {
-                let i = i.cast_i32() - (index.cast_f32() * offset_slope).floor().cast_i32();
-
+            for _i in 0.expr()..trace_length.cast_u32() {
                 let si = index + 1;
                 shared.write(si, light);
                 sync_block();
-                *light =
-                    (1.0 - 2.0 * BLUR) * light + BLUR * (shared.read(si - 1) + shared.read(si + 1));
 
-                let pos = offset
-                    + primary_axis * i
-                    + secondary_axis * (i.cast_f32() * slope).floor().cast_i32();
+                let blur = BLUR / correction;
+
+                *light =
+                    (1.0 - 2.0 * blur) * light + blur * (shared.read(si - 1) + shared.read(si + 1));
+
+                let mask = side_dist <= side_dist.yx();
+                *side_dist += mask.select(delta_dist, Vec2::splat_expr(0.0));
+                *pos += mask.select(step, Vec2::splat_expr(0));
+
                 if pos.x < 0 || pos.x >= GRID_SIZE as i32 || pos.y < 0 || pos.y >= GRID_SIZE as i32
                 {
                     continue;
                 }
 
                 let pos = pos.cast_u32();
+                lights.write(pos.extend(dir), light);
                 let wall = walls.read(pos);
                 if wall > 0.0 {
-                    *light = wall;
+                    *light = wall / NUM_DIRECTIONS as f32;
                 }
-                lights.write(pos.extend(dir), light);
             }
         }),
     );
@@ -201,7 +218,7 @@ fn main() {
     let write_wall_kernel = Kernel::<fn(Vec2<u32>, f32)>::new(
         &device,
         &track!(|pos, value| {
-            walls.write(pos, value);
+            walls.write(pos + dispatch_id().xy(), value);
         }),
     );
 
@@ -235,6 +252,12 @@ fn main() {
             KeyCode::KeyA => {
                 rt.dir = (rt.dir + NUM_DIRECTIONS - 1) % NUM_DIRECTIONS;
             }
+            KeyCode::KeyW => {
+                rt.offset += 1;
+            }
+            KeyCode::KeyS => {
+                rt.offset -= 1;
+            }
             _ => (),
         }
     };
@@ -247,6 +270,12 @@ fn main() {
     let dt = Duration::from_secs_f64(1.0 / 60.0);
 
     let mut avg_iter_time = 0.0;
+
+    // write_wall_kernel.dispatch(
+    //     [GRID_SIZE / 2, GRID_SIZE / 2, 1],
+    //     &Vec2::splat(GRID_SIZE / 4),
+    //     &1.0,
+    // );
 
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop
@@ -268,7 +297,8 @@ fn main() {
 
                             commands.extend([
                                 clear_kernel.dispatch_async([GRID_SIZE, GRID_SIZE, NUM_DIRECTIONS]),
-                                update_kernel.dispatch_async([TRACE_SIZE, NUM_DIRECTIONS, 1]),
+                                update_kernel
+                                    .dispatch_async([TRACE_SIZE, NUM_DIRECTIONS, 1], &rt.t),
                                 draw_kernel.dispatch_async([
                                     GRID_SIZE * SCALING,
                                     GRID_SIZE * SCALING,
