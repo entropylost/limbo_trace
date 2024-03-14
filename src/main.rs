@@ -24,8 +24,8 @@ use winit::{
 };
 
 const GRID_SIZE: u32 = 128;
-const TRACE_SIZE: u32 = 128;
-const TRACE_LENGTH: u32 = 128;
+const TRACE_SIZE: u32 = GRID_SIZE;
+const TRACE_LENGTH: u32 = GRID_SIZE;
 const SCALING: u32 = 16;
 const NUM_DIRECTIONS: u32 = 64;
 const BLUR: f32 = 0.3;
@@ -230,10 +230,10 @@ fn main() {
             (rt.cursor_pos.y as u32) / SCALING,
         );
         if active_buttons.contains(&MouseButton::Left) {
-            write_wall_kernel.dispatch([1, 1, 1], &pos, &1.0);
+            write_wall_kernel.dispatch([4, 4, 1], &pos, &1.0);
         }
         if active_buttons.contains(&MouseButton::Right) {
-            write_wall_kernel.dispatch([1, 1, 1], &pos, &0.001);
+            write_wall_kernel.dispatch([4, 4, 1], &pos, &0.001);
         }
     };
     let update_cursor = &mut update_cursor;
@@ -288,31 +288,40 @@ fn main() {
                     let scope = device.default_stream().scope();
                     scope.present(&swapchain, &display);
 
-                    if dt * rt.t < start.elapsed() {
-                        let iter_st = Instant::now();
-                        rt.t += 1;
-                        update_cursor(&active_buttons, &mut rt);
-                        {
-                            let mut commands = vec![];
+                    // if dt * rt.t < start.elapsed() {
+                    let iter_st = Instant::now();
+                    rt.t += 1;
+                    update_cursor(&active_buttons, &mut rt);
+                    {
+                        let mut commands = vec![];
 
-                            commands.extend([
-                                clear_kernel.dispatch_async([GRID_SIZE, GRID_SIZE, NUM_DIRECTIONS]),
+                        for _i in 0..300 {
+                            commands.push(
                                 update_kernel
                                     .dispatch_async([TRACE_SIZE, NUM_DIRECTIONS, 1], &rt.t),
-                                draw_kernel.dispatch_async([
-                                    GRID_SIZE * SCALING,
-                                    GRID_SIZE * SCALING,
-                                    1,
-                                ]),
-                            ]);
-                            scope.submit(commands);
+                            );
                         }
-                        avg_iter_time =
-                            avg_iter_time * 0.99 + iter_st.elapsed().as_secs_f64() * 0.01;
-                        if rt.t % 60 == 0 {
-                            println!("Avg iter time: {}", avg_iter_time * 1000.0);
-                        }
+
+                        commands.extend([
+                            update_kernel.dispatch_async([TRACE_SIZE, NUM_DIRECTIONS, 1], &rt.t),
+                            draw_kernel.dispatch_async([
+                                GRID_SIZE * SCALING,
+                                GRID_SIZE * SCALING,
+                                1,
+                            ]),
+                        ]);
+                        scope.submit(commands);
                     }
+                    avg_iter_time = avg_iter_time * 0.99 + iter_st.elapsed().as_secs_f64() * 0.01;
+                    if rt.t % 60 == 0 {
+                        println!("Avg iter time: {}", avg_iter_time * 1000.0);
+                        println!("FPS: {}", rt.t as f64 / start.elapsed().as_secs_f64());
+                        println!(
+                            "Avg iter (ms): {}",
+                            start.elapsed().as_secs_f64() / rt.t as f64 * 1000.0
+                        );
+                    }
+                    // }
                     window.request_redraw();
                 }
                 WindowEvent::CursorMoved { position, .. } => {
