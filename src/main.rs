@@ -184,15 +184,15 @@ fn main() {
                     * delta_dist;
             let side_dist = side_dist.var();
 
+            // Remove to make the light look manhattan.
+            let blur = BLUR / correction;
+
             let shared = Shared::<f32>::new(TRACE_SIZE as usize + 2);
 
             for _i in 0.expr()..trace_length.cast_u32() {
                 let si = index + 1;
                 shared.write(si, light);
                 sync_block();
-
-                let blur = BLUR / correction;
-
                 *light =
                     (1.0 - 2.0 * blur) * light + blur * (shared.read(si - 1) + shared.read(si + 1));
 
