@@ -163,15 +163,11 @@ fn main() {
 
             let correction = ray_dir.x.abs() + ray_dir.y.abs();
 
-            let trace_length = correction * correction * TRACE_LENGTH as f32;
+            let trace_length = TRACE_LENGTH.expr().cast_f32(); // correction * correction * TRACE_LENGTH as f32;
 
             let ray_pos = Vec2::<f32>::splat(GRID_SIZE as f32 / 2.0)
                 - (trace_length / 2.0) * Vec2::expr(angle.cos(), angle.sin()) / correction
                 - (TRACE_SIZE as f32 / 2.0) * Vec2::expr(-angle.sin(), angle.cos()) * correction
-                + Vec2::expr(
-                    rand_f32(Vec2::expr(dir, t), 0.expr(), 0),
-                    rand_f32(Vec2::expr(dir, t), 1.expr(), 0),
-                )
                 + index.cast_f32() * Vec2::expr(-step.y.as_f32(), step.x.as_f32())
                 + index.cast_f32()
                     * 2.0_f32.sqrt()
@@ -191,7 +187,7 @@ fn main() {
                 shared.write(si, light);
                 sync_block();
 
-                let blur = BLUR / correction;
+                let blur = BLUR;
 
                 *light =
                     (1.0 - 2.0 * blur) * light + blur * (shared.read(si - 1) + shared.read(si + 1));
@@ -204,13 +200,13 @@ fn main() {
                 {
                     continue;
                 }
-
                 let pos = pos.cast_u32();
-                lights.write(pos.extend(dir), light);
                 let wall = walls.read(pos);
                 if wall > 0.0 {
-                    *light = wall / NUM_DIRECTIONS as f32;
+                    *light = wall;
                 }
+
+                lights.write(pos.extend(index), light);
             }
         }),
     );
